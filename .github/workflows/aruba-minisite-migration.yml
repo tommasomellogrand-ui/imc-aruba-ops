@@ -191,6 +191,12 @@ jobs:
               ftp.retrbinary('RETR ' + path, buf.write)
               return buf.getvalue()
 
+          def signature(files):
+              return {
+                  item['path']: (item.get('size'), item.get('modify'))
+                  for item in files
+              }
+
           text_names = {'.htaccess'}
           text_exts = {'.html', '.htm', '.js', '.css', '.php', '.json', '.txt', '.xml', '.svg'}
           ref_re = re.compile(r'(["\'])([^"\']*app-core\.js(?:\?[^"\']*)?)\1')
@@ -209,8 +215,6 @@ jobs:
               def repl(match):
                   nonlocal count
                   original = match.group(2)
-                  if 'app-core.js' not in original:
-                      return match.group(0)
                   suffix = ''
                   if '?' in original:
                       suffix = '?' + original.split('?', 1)[1]
@@ -224,7 +228,7 @@ jobs:
           try:
               ftp = connect()
               try:
-                  # Full preflight before the first write.
+                  # Phase 1: inventory all sources. No writes are allowed yet.
                   source_inventory = {}
                   for src in source_roots:
                       dirs, files = list_files(ftp, src)
@@ -236,6 +240,29 @@ jobs:
                   if not shared_meta:
                       raise RuntimeError(f'Motore condiviso sorgente assente: {shared_source}')
 
+                  # Phase 2: download the complete source snapshot before the first write.
+                  staged_payloads = {}
+                  for src in source_roots:
+                      for item in source_inventory[src]['files']:
+                          payload = retrieve(ftp, item['path'])
+                          if item.get('size') is not None and len(payload) != item['size']:
+                              raise RuntimeError(f'Dimensione sorgente cambiata durante staging: {item["path"]}')
+                          staged_payloads[item['path']] = payload
+
+                  staged_shared = retrieve(ftp, shared_source)
+                  if shared_meta.get('size') is not None and len(staged_shared) != shared_meta['size']:
+                      raise RuntimeError(f'Dimensione motore condiviso cambiata durante staging: {shared_source}')
+
+                  # Phase 3: re-read metadata. Any concurrent deploy/change aborts before writes.
+                  for src in source_roots:
+                      _, current_files = list_files(ftp, src)
+                      if signature(current_files) != signature(source_inventory[src]['files']):
+                          raise RuntimeError(f'Sorgente cambiata durante preflight: {src}')
+
+                  current_shared_meta = file_exists(ftp, shared_source)
+                  if current_shared_meta != shared_meta:
+                      raise RuntimeError(f'Motore condiviso cambiato durante preflight: {shared_source}')
+
                   report['preflight'] = {
                       'gameworlds': {
                           src: {
@@ -245,10 +272,12 @@ jobs:
                           for src in source_roots
                       },
                       'shared_source': {'path': shared_source, **shared_meta},
+                      'staged_files': len(staged_payloads) + 1,
+                      'snapshot_stable': True,
                       'all_sources_ready': True,
                   }
 
-                  # All preflight checks passed. Writes are now allowed only under /minisite/.
+                  # Phase 4: all sources are now staged and stable. Writes begin only under /minisite/.
                   mkdir_p(ftp, destination_root)
                   mkdir_p(ftp, destination_root + '/shared')
 
@@ -267,7 +296,7 @@ jobs:
                           source_path = item['path']
                           rel = posixpath.relpath(source_path, src)
                           destination_path = ensure_destination_path(posixpath.join(dst, rel))
-                          payload = retrieve(ftp, source_path)
+                          payload = staged_payloads[source_path]
                           payload, replacements = update_shared_reference(source_path, payload)
                           mkdir_p(ftp, posixpath.dirname(destination_path))
                           ftp.storbinary('STOR ' + destination_path, io.BytesIO(payload))
@@ -285,18 +314,17 @@ jobs:
                                   'count': replacements,
                               })
 
-                  shared_payload = retrieve(ftp, shared_source)
-                  ftp.storbinary('STOR ' + shared_destination, io.BytesIO(shared_payload))
-                  shared_digest = hashlib.sha256(shared_payload).hexdigest()
+                  ftp.storbinary('STOR ' + shared_destination, io.BytesIO(staged_shared))
+                  shared_digest = hashlib.sha256(staged_shared).hexdigest()
                   expected_payloads[shared_destination] = shared_digest
                   report['copied'].append({
                       'source': shared_source,
                       'destination': shared_destination,
-                      'bytes': len(shared_payload),
+                      'bytes': len(staged_shared),
                       'sha256': shared_digest,
                   })
 
-                  # Verify every uploaded file by reading the new destination back.
+                  # Verify every uploaded file by reading only the destination back.
                   for destination_path, expected_digest in expected_payloads.items():
                       ensure_destination_path(destination_path)
                       buf = io.BytesIO()
@@ -376,6 +404,7 @@ jobs:
               if summary:
                   with open(summary, 'a', encoding='utf-8') as fh:
                       fh.write('## OPS-002 · ARUBA Minisite Migration\n\n')
+                      fh.write(f"- File staged prima della prima write: **{report['preflight'].get('staged_files', 0)}**\n")
                       fh.write(f"- File copiati: **{len(report['copied'])}**\n")
                       fh.write(f"- Riferimenti app-core aggiornati: **{sum(x['count'] for x in report['reference_updates'])}**\n")
                       fh.write(f"- File verificati via SHA-256: **{sum(1 for x in report['verification'] if x.get('ok'))}**\n")
