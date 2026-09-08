@@ -15,29 +15,46 @@ concurrency:
 jobs:
   dispatch:
     name: Dispatch approved OPS command
-    if: ${{ github.event.issue.title == 'RUN ARUBA FILESYSTEM INVENTORY' }}
+    if: ${{ github.event.issue.title == 'RUN ARUBA FILESYSTEM INVENTORY' || github.event.issue.title == 'RUN ARUBA MINISITE MIGRATION' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Dispatch OPS-001
+      - name: Dispatch approved OPS command
         env:
           GH_TOKEN: ${{ github.token }}
+          OPS_TITLE: ${{ github.event.issue.title }}
         shell: bash
         run: |
           set -euo pipefail
-          gh workflow run aruba-filesystem-inventory.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref main
-          echo "Dispatched OPS-001 · ARUBA Filesystem Inventory"
 
-      - name: Record trigger summary
-        shell: bash
-        run: |
+          case "$OPS_TITLE" in
+            'RUN ARUBA FILESYSTEM INVENTORY')
+              WORKFLOW='aruba-filesystem-inventory.yml'
+              COMMAND='OPS-001 · ARUBA Filesystem Inventory'
+              gh workflow run "$WORKFLOW" \
+                --repo "$GITHUB_REPOSITORY" \
+                --ref main
+              ;;
+            'RUN ARUBA MINISITE MIGRATION')
+              WORKFLOW='aruba-minisite-migration.yml'
+              COMMAND='OPS-002 · ARUBA Minisite Migration'
+              gh workflow run "$WORKFLOW" \
+                --repo "$GITHUB_REPOSITORY" \
+                --ref main \
+                -f confirm=MIGRATE_MINISITES
+              ;;
+            *)
+              echo "Titolo non autorizzato: $OPS_TITLE" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Dispatched $COMMAND"
           {
             echo '## IMC Aruba Ops Trigger'
             echo
-            echo '- Command: `OPS-001 · ARUBA Filesystem Inventory`'
-            echo '- Trigger title: `RUN ARUBA FILESYSTEM INVENTORY`'
-            echo '- Dispatch target: `aruba-filesystem-inventory.yml`'
+            echo "- Command: \`$COMMAND\`"
+            echo "- Trigger title: \`$OPS_TITLE\`"
+            echo "- Dispatch target: \`$WORKFLOW\`"
             echo '- Ref: `main`'
           } >> "$GITHUB_STEP_SUMMARY"
