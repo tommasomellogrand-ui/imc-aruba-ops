@@ -1,0 +1,404 @@
+name: OPS-002 · ARUBA Minisite Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type MIGRATE_MINISITES to authorize the controlled migration'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imc-aruba-minisite-migration
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Controlled minisite migration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ARUBA_FTP_HOST: ${{ vars.ARUBA_FTP_HOST }}
+      ARUBA_FTP_PORT: ${{ vars.ARUBA_FTP_PORT }}
+      ARUBA_WEB_ROOT: ${{ vars.ARUBA_WEB_ROOT }}
+      ARUBA_FTP_USERNAME: ${{ secrets.ARUBA_FTP_USERNAME }}
+      ARUBA_FTP_PASSWORD: ${{ secrets.ARUBA_FTP_PASSWORD }}
+      CONFIRM: ${{ inputs.confirm }}
+
+    steps:
+      - name: Validate authorization and configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${CONFIRM:-}" = "MIGRATE_MINISITES"
+          test -n "${ARUBA_FTP_HOST:-}"
+          test -n "${ARUBA_FTP_PORT:-}"
+          test -n "${ARUBA_WEB_ROOT:-}"
+          test -n "${ARUBA_FTP_USERNAME:-}"
+          test -n "${ARUBA_FTP_PASSWORD:-}"
+          test "$ARUBA_WEB_ROOT" = "/www.italianmastersclub.it"
+          test "$ARUBA_FTP_PORT" = "21"
+          echo "OPS-002 authorized. Destination writes are restricted to /www.italianmastersclub.it/minisite/."
+
+      - name: Migrate minisites on Aruba
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import posixpath
+          import re
+          import ssl
+          from ftplib import FTP_TLS, error_perm
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          from urllib.request import Request, urlopen
+          from html.parser import HTMLParser
+
+          host = os.environ['ARUBA_FTP_HOST'].strip()
+          port = int(os.environ['ARUBA_FTP_PORT'])
+          username = os.environ['ARUBA_FTP_USERNAME']
+          password = os.environ['ARUBA_FTP_PASSWORD']
+          root = os.environ['ARUBA_WEB_ROOT'].rstrip('/')
+
+          expected_root = '/www.italianmastersclub.it'
+          destination_root = expected_root + '/minisite'
+          shared_source = expected_root + '/site-assets/gameworld/app-core.js'
+          shared_destination = destination_root + '/shared/app-core.js'
+          source_roots = [expected_root + f'/gameworld{i:03d}' for i in range(1, 16)]
+
+          report = {
+              'operation': 'OPS-002 · ARUBA Minisite Migration',
+              'mode': 'controlled-copy-no-delete',
+              'destination_root': destination_root,
+              'preflight': {},
+              'copied': [],
+              'reference_updates': [],
+              'verification': [],
+              'http': [],
+              'errors': [],
+          }
+
+          def write_report():
+              Path('aruba-minisite-migration.json').write_text(
+                  json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+              )
+              lines = [
+                  f"OPERATION\t{report['operation']}",
+                  f"MODE\t{report['mode']}",
+                  f"DESTINATION_ROOT\t{destination_root}",
+                  f"COPIED_FILES\t{len(report['copied'])}",
+                  f"REFERENCE_UPDATES\t{sum(x['count'] for x in report['reference_updates'])}",
+                  f"VERIFIED_FILES\t{sum(1 for x in report['verification'] if x.get('ok'))}",
+                  f"HTTP_CHECKS\t{len(report['http'])}",
+                  f"ERRORS\t{len(report['errors'])}",
+                  '',
+              ]
+              for item in report['http']:
+                  lines.append(f"HTTP\t{item.get('status')}\t{item.get('bytes')}\t{item.get('url')}\t{item.get('final_url','')}")
+              for item in report['errors']:
+                  lines.append(f"ERROR\t{item}")
+              Path('aruba-minisite-migration.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          if root != expected_root:
+              raise SystemExit(f'ARUBA_WEB_ROOT non autorizzata: {root}')
+          if port != 21:
+              raise SystemExit(f'Porta FTP non autorizzata: {port}')
+
+          ctx = ssl.create_default_context()
+          ctx.check_hostname = False
+
+          def connect():
+              ftp = FTP_TLS(context=ctx)
+              ftp.connect(host, port, timeout=60)
+              ftp.login(username, password)
+              ftp.prot_p()
+              ftp.set_pasv(True)
+              return ftp
+
+          def ensure_source_path(path: str):
+              if path not in source_roots and path != shared_source and not any(path.startswith(src + '/') for src in source_roots):
+                  raise RuntimeError(f'Path sorgente non autorizzato: {path}')
+
+          def ensure_destination_path(path: str):
+              normalized = posixpath.normpath(path)
+              if normalized != destination_root and not normalized.startswith(destination_root + '/'):
+                  raise RuntimeError(f'Write fuori /minisite/ bloccata: {path}')
+              return normalized
+
+          def list_files(ftp, base: str):
+              ensure_source_path(base)
+              files = []
+              dirs = []
+
+              def walk(path: str):
+                  ensure_source_path(path)
+                  entries = list(ftp.mlsd(path, facts=['type', 'size', 'modify']))
+                  entries.sort(key=lambda x: x[0].lower())
+                  for name, facts in entries:
+                      if name in ('.', '..') or '/' in name or '\\' in name:
+                          continue
+                      child = posixpath.normpath(posixpath.join(path, name))
+                      ensure_source_path(child)
+                      kind = facts.get('type', 'unknown')
+                      if kind == 'dir':
+                          dirs.append(child)
+                          walk(child)
+                      elif kind == 'file':
+                          files.append({
+                              'path': child,
+                              'size': int(facts['size']) if str(facts.get('size', '')).isdigit() else None,
+                              'modify': facts.get('modify') or None,
+                          })
+              walk(base)
+              return dirs, files
+
+          def file_exists(ftp, path: str):
+              parent, name = posixpath.split(path)
+              for entry_name, facts in ftp.mlsd(parent, facts=['type', 'size', 'modify']):
+                  if entry_name == name and facts.get('type') == 'file':
+                      return {
+                          'size': int(facts['size']) if str(facts.get('size', '')).isdigit() else None,
+                          'modify': facts.get('modify') or None,
+                      }
+              return None
+
+          def mkdir_p(ftp, path: str):
+              path = ensure_destination_path(path)
+              parts = [p for p in path.split('/') if p]
+              current = ''
+              for part in parts:
+                  current += '/' + part
+                  if current == '/www' or current == '/www/italianmastersclub.it':
+                      continue
+                  if current != destination_root and not current.startswith(destination_root + '/'):
+                      continue
+                  try:
+                      ftp.mkd(current)
+                  except error_perm as exc:
+                      if not str(exc).startswith('550'):
+                          raise
+
+          def retrieve(ftp, path: str) -> bytes:
+              ensure_source_path(path)
+              buf = io.BytesIO()
+              ftp.retrbinary('RETR ' + path, buf.write)
+              return buf.getvalue()
+
+          text_names = {'.htaccess'}
+          text_exts = {'.html', '.htm', '.js', '.css', '.php', '.json', '.txt', '.xml', '.svg'}
+          ref_re = re.compile(r'(["\'])([^"\']*app-core\.js(?:\?[^"\']*)?)\1')
+
+          def update_shared_reference(path: str, payload: bytes):
+              name = posixpath.basename(path)
+              ext = posixpath.splitext(name)[1].lower()
+              if name not in text_names and ext not in text_exts:
+                  return payload, 0
+              try:
+                  text = payload.decode('utf-8')
+              except UnicodeDecodeError:
+                  return payload, 0
+
+              count = 0
+              def repl(match):
+                  nonlocal count
+                  original = match.group(2)
+                  if 'app-core.js' not in original:
+                      return match.group(0)
+                  suffix = ''
+                  if '?' in original:
+                      suffix = '?' + original.split('?', 1)[1]
+                  count += 1
+                  q = match.group(1)
+                  return f"{q}/minisite/shared/app-core.js{suffix}{q}"
+
+              new_text = ref_re.sub(repl, text)
+              return new_text.encode('utf-8'), count
+
+          try:
+              ftp = connect()
+              try:
+                  # Full preflight before the first write.
+                  source_inventory = {}
+                  for src in source_roots:
+                      dirs, files = list_files(ftp, src)
+                      if not files:
+                          raise RuntimeError(f'Sorgente vuota o senza file: {src}')
+                      source_inventory[src] = {'dirs': dirs, 'files': files}
+
+                  shared_meta = file_exists(ftp, shared_source)
+                  if not shared_meta:
+                      raise RuntimeError(f'Motore condiviso sorgente assente: {shared_source}')
+
+                  report['preflight'] = {
+                      'gameworlds': {
+                          src: {
+                              'directories': len(source_inventory[src]['dirs']),
+                              'files': len(source_inventory[src]['files']),
+                          }
+                          for src in source_roots
+                      },
+                      'shared_source': {'path': shared_source, **shared_meta},
+                      'all_sources_ready': True,
+                  }
+
+                  # All preflight checks passed. Writes are now allowed only under /minisite/.
+                  mkdir_p(ftp, destination_root)
+                  mkdir_p(ftp, destination_root + '/shared')
+
+                  expected_payloads = {}
+
+                  for index, src in enumerate(source_roots, start=1):
+                      dst = destination_root + f'/GW{index:03d}'
+                      mkdir_p(ftp, dst)
+                      inv = source_inventory[src]
+
+                      for source_dir in inv['dirs']:
+                          rel = posixpath.relpath(source_dir, src)
+                          mkdir_p(ftp, posixpath.join(dst, rel))
+
+                      for item in inv['files']:
+                          source_path = item['path']
+                          rel = posixpath.relpath(source_path, src)
+                          destination_path = ensure_destination_path(posixpath.join(dst, rel))
+                          payload = retrieve(ftp, source_path)
+                          payload, replacements = update_shared_reference(source_path, payload)
+                          mkdir_p(ftp, posixpath.dirname(destination_path))
+                          ftp.storbinary('STOR ' + destination_path, io.BytesIO(payload))
+                          digest = hashlib.sha256(payload).hexdigest()
+                          expected_payloads[destination_path] = digest
+                          report['copied'].append({
+                              'source': source_path,
+                              'destination': destination_path,
+                              'bytes': len(payload),
+                              'sha256': digest,
+                          })
+                          if replacements:
+                              report['reference_updates'].append({
+                                  'destination': destination_path,
+                                  'count': replacements,
+                              })
+
+                  shared_payload = retrieve(ftp, shared_source)
+                  ftp.storbinary('STOR ' + shared_destination, io.BytesIO(shared_payload))
+                  shared_digest = hashlib.sha256(shared_payload).hexdigest()
+                  expected_payloads[shared_destination] = shared_digest
+                  report['copied'].append({
+                      'source': shared_source,
+                      'destination': shared_destination,
+                      'bytes': len(shared_payload),
+                      'sha256': shared_digest,
+                  })
+
+                  # Verify every uploaded file by reading the new destination back.
+                  for destination_path, expected_digest in expected_payloads.items():
+                      ensure_destination_path(destination_path)
+                      buf = io.BytesIO()
+                      ftp.retrbinary('RETR ' + destination_path, buf.write)
+                      actual_digest = hashlib.sha256(buf.getvalue()).hexdigest()
+                      ok = actual_digest == expected_digest
+                      report['verification'].append({
+                          'path': destination_path,
+                          'ok': ok,
+                          'sha256': actual_digest,
+                      })
+                      if not ok:
+                          raise RuntimeError(f'Verifica hash fallita: {destination_path}')
+              finally:
+                  try:
+                      ftp.quit()
+                  except Exception:
+                      ftp.close()
+
+              class AssetParser(HTMLParser):
+                  def __init__(self):
+                      super().__init__()
+                      self.assets = []
+                  def handle_starttag(self, tag, attrs):
+                      attrs = dict(attrs)
+                      if tag == 'script' and attrs.get('src'):
+                          self.assets.append(attrs['src'])
+                      elif tag == 'link' and attrs.get('href') and 'stylesheet' in attrs.get('rel', '').lower():
+                          self.assets.append(attrs['href'])
+                      elif tag == 'img' and attrs.get('src'):
+                          self.assets.append(attrs['src'])
+
+              checked = set()
+              def http_get(url: str):
+                  if url in checked:
+                      return None
+                  checked.add(url)
+                  req = Request(url, headers={'User-Agent': 'IMC-Aruba-Ops/OPS-002'})
+                  with urlopen(req, timeout=30) as response:
+                      body = response.read()
+                      status = response.status
+                      final_url = response.geturl()
+                      content_type = response.headers.get('Content-Type')
+                  item = {
+                      'url': url,
+                      'status': status,
+                      'bytes': len(body),
+                      'content_type': content_type,
+                      'final_url': final_url,
+                  }
+                  report['http'].append(item)
+                  if status < 200 or status >= 400:
+                      raise RuntimeError(f'HTTP non valido {status}: {url}')
+                  return body, final_url, content_type
+
+              base_site = 'https://italianmastersclub.it'
+              for i in range(1, 16):
+                  url = base_site + f'/minisite/GW{i:03d}/'
+                  result = http_get(url)
+                  if result:
+                      body, final_url, content_type = result
+                      if content_type and 'text/html' in content_type.lower():
+                          parser = AssetParser()
+                          parser.feed(body.decode('utf-8', errors='replace'))
+                          for asset in parser.assets:
+                              absolute = urljoin(final_url, asset)
+                              parsed = urlparse(absolute)
+                              if parsed.netloc in {'italianmastersclub.it', 'www.italianmastersclub.it'} and parsed.path.startswith('/minisite/'):
+                                  http_get(absolute)
+
+              http_get(base_site + '/minisite/shared/app-core.js')
+
+              report['result'] = 'SUCCESS'
+              write_report()
+
+              summary = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary, 'a', encoding='utf-8') as fh:
+                      fh.write('## OPS-002 · ARUBA Minisite Migration\n\n')
+                      fh.write(f"- File copiati: **{len(report['copied'])}**\n")
+                      fh.write(f"- Riferimenti app-core aggiornati: **{sum(x['count'] for x in report['reference_updates'])}**\n")
+                      fh.write(f"- File verificati via SHA-256: **{sum(1 for x in report['verification'] if x.get('ok'))}**\n")
+                      fh.write(f"- Controlli HTTP: **{len(report['http'])}**\n")
+                      fh.write('- Originali eliminati/modificati: **NO**\n')
+                      fh.write('- Write consentite: **solo /www.italianmastersclub.it/minisite/**\n')
+
+              print('OPS-002 completata con successo.')
+
+          except Exception as exc:
+              report['result'] = 'FAILED'
+              report['errors'].append(f'{type(exc).__name__}: {exc}')
+              write_report()
+              raise
+          PY
+
+      - name: Upload migration report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aruba-minisite-migration-report
+          path: |
+            aruba-minisite-migration.txt
+            aruba-minisite-migration.json
+          retention-days: 7
+          if-no-files-found: warn
