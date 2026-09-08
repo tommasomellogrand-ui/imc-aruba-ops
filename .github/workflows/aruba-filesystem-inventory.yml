@@ -1,0 +1,183 @@
+name: ARUBA Filesystem Inventory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imc-aruba-filesystem-inventory
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    name: Read-only filesystem inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ARUBA_FTP_HOST: ${{ vars.ARUBA_FTP_HOST }}
+      ARUBA_FTP_PORT: ${{ vars.ARUBA_FTP_PORT }}
+      ARUBA_WEB_ROOT: ${{ vars.ARUBA_WEB_ROOT }}
+      ARUBA_FTP_USERNAME: ${{ secrets.ARUBA_FTP_USERNAME }}
+      ARUBA_FTP_PASSWORD: ${{ secrets.ARUBA_FTP_PASSWORD }}
+
+    steps:
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ARUBA_FTP_HOST:-}"
+          test -n "${ARUBA_FTP_PORT:-}"
+          test -n "${ARUBA_WEB_ROOT:-}"
+          test -n "${ARUBA_FTP_USERNAME:-}"
+          test -n "${ARUBA_FTP_PASSWORD:-}"
+          test "$ARUBA_WEB_ROOT" = "/www.italianmastersclub.it"
+          test "$ARUBA_FTP_PORT" = "21"
+          echo "Configurazione presente. Inventario limitato a /www.italianmastersclub.it."
+
+      - name: Inventory Aruba filesystem
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import posixpath
+          import ssl
+          from ftplib import FTP_TLS, error_perm
+          from pathlib import Path
+
+          host = os.environ['ARUBA_FTP_HOST'].strip()
+          port = int(os.environ['ARUBA_FTP_PORT'])
+          username = os.environ['ARUBA_FTP_USERNAME']
+          password = os.environ['ARUBA_FTP_PASSWORD']
+          root = os.environ['ARUBA_WEB_ROOT'].rstrip('/') or '/'
+
+          expected_root = '/www.italianmastersclub.it'
+          if root != expected_root:
+              raise SystemExit(f'ARUBA_WEB_ROOT non autorizzata: {root}')
+          if port != 21:
+              raise SystemExit(f'Porta FTP non autorizzata: {port}')
+
+          ctx = ssl.create_default_context()
+          ctx.check_hostname = False
+          ftp = FTP_TLS(context=ctx)
+          ftp.connect(host, port, timeout=60)
+          ftp.login(username, password)
+          ftp.prot_p()
+          ftp.set_pasv(True)
+
+          max_depth = 30
+          max_entries = 50000
+          rows = []
+          errors = []
+
+          def safe_child(parent: str, name: str) -> str:
+              if name in ('.', '..') or '/' in name or '\\' in name:
+                  raise ValueError(f'Nome FTP non sicuro: {name!r}')
+              child = posixpath.normpath(posixpath.join(parent, name))
+              if child != expected_root and not child.startswith(expected_root + '/'):
+                  raise ValueError(f'Path fuori root autorizzata: {child}')
+              return child
+
+          def walk(path: str, depth: int) -> None:
+              if depth > max_depth:
+                  errors.append({'path': path, 'error': 'max_depth_exceeded'})
+                  return
+              if len(rows) >= max_entries:
+                  raise RuntimeError(f'Limite massimo di {max_entries} elementi raggiunto.')
+              try:
+                  entries = list(ftp.mlsd(path, facts=['type', 'size', 'modify']))
+              except error_perm as exc:
+                  errors.append({'path': path, 'error': f'permission_or_listing_error: {exc}'})
+                  return
+              except Exception as exc:
+                  errors.append({'path': path, 'error': f'listing_error: {type(exc).__name__}: {exc}'})
+                  return
+
+              entries.sort(key=lambda item: item[0].lower())
+              for name, facts in entries:
+                  if name in ('.', '..'):
+                      continue
+                  child = safe_child(path, name)
+                  item_type = facts.get('type', 'unknown')
+                  row = {
+                      'path': child,
+                      'type': item_type,
+                      'size': int(facts['size']) if str(facts.get('size', '')).isdigit() else None,
+                      'modify': facts.get('modify') or None,
+                      'depth': depth,
+                  }
+                  rows.append(row)
+                  if len(rows) >= max_entries:
+                      raise RuntimeError(f'Limite massimo di {max_entries} elementi raggiunto.')
+                  if item_type == 'dir':
+                      walk(child, depth + 1)
+
+          try:
+              walk(expected_root, 0)
+          finally:
+              try:
+                  ftp.quit()
+              except Exception:
+                  ftp.close()
+
+          directories = sum(1 for row in rows if row['type'] == 'dir')
+          files = sum(1 for row in rows if row['type'] == 'file')
+          total_size = sum((row['size'] or 0) for row in rows if row['type'] == 'file')
+
+          txt = Path('aruba-filesystem-inventory.txt')
+          with txt.open('w', encoding='utf-8') as fh:
+              fh.write(f'ROOT\t{expected_root}\n')
+              fh.write(f'ENTRIES\t{len(rows)}\n')
+              fh.write(f'DIRECTORIES\t{directories}\n')
+              fh.write(f'FILES\t{files}\n')
+              fh.write(f'FILE_BYTES\t{total_size}\n')
+              fh.write('\nTYPE\tSIZE\tMODIFY\tPATH\n')
+              for row in rows:
+                  size = '' if row['size'] is None else str(row['size'])
+                  modify = row['modify'] or ''
+                  fh.write(f"{row['type']}\t{size}\t{modify}\t{row['path']}\n")
+              if errors:
+                  fh.write('\nERRORS\n')
+                  for error in errors:
+                      fh.write(f"{error['path']}\t{error['error']}\n")
+
+          Path('aruba-filesystem-inventory.json').write_text(
+              json.dumps({
+                  'root': expected_root,
+                  'entry_count': len(rows),
+                  'directory_count': directories,
+                  'file_count': files,
+                  'file_bytes': total_size,
+                  'entries': rows,
+                  'errors': errors,
+              }, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as fh:
+                  fh.write('## ARUBA Filesystem Inventory\n\n')
+                  fh.write(f'- Root autorizzata: `{expected_root}`\n')
+                  fh.write(f'- Elementi: **{len(rows)}**\n')
+                  fh.write(f'- Cartelle: **{directories}**\n')
+                  fh.write(f'- File: **{files}**\n')
+                  fh.write(f'- Byte file censiti: **{total_size}**\n')
+                  fh.write(f'- Errori di lettura: **{len(errors)}**\n')
+                  fh.write('- Modalità: **READ-ONLY**\n')
+
+          print(f'Inventario completato: {len(rows)} elementi, {directories} cartelle, {files} file, {len(errors)} errori di lettura.')
+          PY
+
+      - name: Upload inventory report
+        uses: actions/upload-artifact@v4
+        with:
+          name: aruba-filesystem-inventory
+          path: |
+            aruba-filesystem-inventory.txt
+            aruba-filesystem-inventory.json
+          retention-days: 3
+          if-no-files-found: error
