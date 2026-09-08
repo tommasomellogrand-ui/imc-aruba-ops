@@ -1,0 +1,43 @@
+name: IMC Aruba Ops Trigger
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: imc-aruba-ops-trigger
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Dispatch approved OPS command
+    if: ${{ github.event.issue.title == 'RUN ARUBA FILESYSTEM INVENTORY' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch OPS-001
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run aruba-filesystem-inventory.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main
+          echo "Dispatched OPS-001 · ARUBA Filesystem Inventory"
+
+      - name: Record trigger summary
+        shell: bash
+        run: |
+          {
+            echo '## IMC Aruba Ops Trigger'
+            echo
+            echo '- Command: `OPS-001 · ARUBA Filesystem Inventory`'
+            echo '- Trigger title: `RUN ARUBA FILESYSTEM INVENTORY`'
+            echo '- Dispatch target: `aruba-filesystem-inventory.yml`'
+            echo '- Ref: `main`'
+          } >> "$GITHUB_STEP_SUMMARY"
