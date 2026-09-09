@@ -1,0 +1,146 @@
+name: OPS-003 · Deploy Minisite Shared Core
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'payloads/minisite/shared/app-core.js'
+      - '.github/workflows/deploy-minisite-shared-core.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imc-aruba-minisite-shared-core
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ARUBA_FTP_HOST: ${{ vars.ARUBA_FTP_HOST }}
+      ARUBA_FTP_PORT: ${{ vars.ARUBA_FTP_PORT }}
+      ARUBA_FTP_ROOT: ${{ vars.ARUBA_FTP_ROOT }}
+      ARUBA_WEB_ROOT: ${{ vars.ARUBA_WEB_ROOT }}
+      ARUBA_FTP_USERNAME: ${{ secrets.ARUBA_FTP_USERNAME }}
+      ARUBA_FTP_PASSWORD: ${{ secrets.ARUBA_FTP_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate payload and Aruba configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s payloads/minisite/shared/app-core.js
+          node --check payloads/minisite/shared/app-core.js
+          grep -q "IMC_MINISITE_DATA" payloads/minisite/shared/app-core.js
+          grep -q "minisite_read" payloads/minisite/shared/app-core.js
+          test -n "${ARUBA_FTP_HOST:-}"
+          test -n "${ARUBA_FTP_PORT:-}"
+          test -n "${ARUBA_FTP_ROOT:-}"
+          test -n "${ARUBA_WEB_ROOT:-}"
+          test -n "${ARUBA_FTP_USERNAME:-}"
+          test -n "${ARUBA_FTP_PASSWORD:-}"
+          test "$ARUBA_FTP_PORT" = "21"
+          test "$ARUBA_FTP_ROOT" = "/"
+          test "$ARUBA_WEB_ROOT" = "/www.italianmastersclub.it"
+
+      - name: Deploy shared core through Aruba Ops
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import os
+          import ssl
+          from ftplib import FTP_TLS, error_perm
+          from pathlib import Path
+
+          host = os.environ['ARUBA_FTP_HOST'].strip()
+          port = int(os.environ['ARUBA_FTP_PORT'])
+          username = os.environ['ARUBA_FTP_USERNAME']
+          password = os.environ['ARUBA_FTP_PASSWORD']
+          web_root = os.environ['ARUBA_WEB_ROOT'].rstrip('/')
+
+          local = Path('payloads/minisite/shared/app-core.js')
+          remote_dir = web_root + '/minisite/shared'
+          remote_file = remote_dir + '/app-core.js'
+
+          if web_root != '/www.italianmastersclub.it':
+              raise SystemExit('ARUBA_WEB_ROOT non autorizzata')
+
+          ctx = ssl.create_default_context()
+          ctx.check_hostname = False
+          ftp = FTP_TLS(context=ctx)
+          ftp.connect(host, port, timeout=60)
+          ftp.login(username, password)
+          ftp.prot_p()
+          ftp.set_pasv(True)
+
+          try:
+              ftp.cwd('/')
+              current = ''
+              for part in [p for p in remote_dir.split('/') if p]:
+                  current += '/' + part
+                  try:
+                      ftp.cwd(current)
+                  except error_perm as exc:
+                      if current in ('/www', '/www/italianmastersclub.it'):
+                          raise
+                      ftp.mkd(current)
+                      ftp.cwd(current)
+
+              data = local.read_bytes()
+              ftp.storbinary('STOR ' + remote_file, io.BytesIO(data))
+
+              check = io.BytesIO()
+              ftp.retrbinary('RETR ' + remote_file, check.write)
+              actual = check.getvalue()
+              if actual != data:
+                  raise SystemExit('Verifica byte-per-byte fallita')
+
+              print('SHA256=' + hashlib.sha256(data).hexdigest())
+              print('Deploy FTP e verifica byte-per-byte completati')
+          finally:
+              try:
+                  ftp.quit()
+              except Exception:
+                  ftp.close()
+          PY
+
+      - name: Verify live shared core
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://italianmastersclub.it/minisite/shared/app-core.js?verify=${GITHUB_SHA}"
+          body="$(curl --fail --silent --show-error --location --max-time 30 "$url")"
+          printf '%s' "$body" | grep -q "IMC_MINISITE_DATA"
+          printf '%s' "$body" | grep -q "minisite_read"
+          echo "Live shared core verified"
+
+      - name: Verify MINISITE Gateway CORE read
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error --location --max-time 30 \
+            -H 'Content-Type: application/json' \
+            --data '{"channel":"MINISITE","action":"minisite_read","resource":"game_world_codex","game_world_id":"GW005"}' \
+            'https://italianmastersclub.it/imc-universal-gateway/')"
+          RESPONSE="$response" python3 - <<'PY'
+          import json, os
+          data = json.loads(os.environ['RESPONSE'])
+          if not data.get('ok'):
+              raise SystemExit('Gateway minisite_read non ok')
+          rows = data.get('rows') or []
+          if not rows:
+              raise SystemExit('Gateway minisite_read senza righe')
+          row = rows[0]
+          if row.get('IMC GW') != 'GW005':
+              raise SystemExit('GW005 non verificato')
+          print('Gateway CORE read verified: GW005')
+          PY
