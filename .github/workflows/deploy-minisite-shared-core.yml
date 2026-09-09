@@ -127,10 +127,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          response="$(curl --fail --silent --show-error --location --max-time 30 \
+          response="$(curl --fail --silent --show-error --max-time 30 \
             -H 'Content-Type: application/json' \
             --data '{"channel":"MINISITE","action":"minisite_read","resource":"game_world_codex","game_world_id":"GW005"}' \
-            'https://italianmastersclub.it/imc-universal-gateway/')"
+            'https://www.italianmastersclub.it/imc-universal-gateway/')"
           RESPONSE="$response" python3 - <<'PY'
           import json, os
           data = json.loads(os.environ['RESPONSE'])
