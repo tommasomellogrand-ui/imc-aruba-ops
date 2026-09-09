@@ -140,7 +140,7 @@ jobs:
           if not rows:
               raise SystemExit('Gateway minisite_read senza righe')
           row = rows[0]
-          if row.get('IMC GW') != 'GW005':
+          if row.get('game_world_id') != 'GW005':
               raise SystemExit('GW005 non verificato')
           print('Gateway CORE read verified: GW005')
           PY
