@@ -39,6 +39,8 @@ jobs:
           node --check payloads/minisite/shared/app-core.js
           grep -q "IMC_MINISITE_DATA" payloads/minisite/shared/app-core.js
           grep -q "minisite_read" payloads/minisite/shared/app-core.js
+          grep -q "SITE_RESOURCES" payloads/minisite/shared/app-core.js
+          grep -q "sm_player_stats" payloads/minisite/shared/app-core.js
           test -n "${ARUBA_FTP_HOST:-}"
           test -n "${ARUBA_FTP_PORT:-}"
           test -n "${ARUBA_FTP_ROOT:-}"
@@ -121,6 +123,8 @@ jobs:
           body="$(curl --fail --silent --show-error --location --max-time 30 "$url")"
           printf '%s' "$body" | grep -q "IMC_MINISITE_DATA"
           printf '%s' "$body" | grep -q "minisite_read"
+          printf '%s' "$body" | grep -q "SITE_RESOURCES"
+          printf '%s' "$body" | grep -q "sm_player_stats"
           echo "Live shared core verified"
 
       - name: Verify MINISITE Gateway CORE read
@@ -143,4 +147,52 @@ jobs:
           if row.get('game_world_id') != 'GW005':
               raise SystemExit('GW005 non verificato')
           print('Gateway CORE read verified: GW005')
+          PY
+
+      - name: Verify MINISITE Gateway Site reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import urllib.request
+
+          url = 'https://www.italianmastersclub.it/imc-universal-gateway/'
+          cases = [
+              ('GW005', 'results', 'Sql1956795_3'),
+              ('GW005', 'schedule', 'Sql1956795_3'),
+              ('GW005', 'match_report', 'Sql1956795_3'),
+              ('GW005', 'transfers', 'Sql1956795_3'),
+              ('GW005', 'sm_player_stats', 'Sql1956795_3'),
+              ('GW002', 'results', 'Sql1956795_2'),
+          ]
+          for gw, resource, database in cases:
+              payload = json.dumps({
+                  'channel': 'MINISITE',
+                  'action': 'minisite_read',
+                  'resource': resource,
+                  'game_world_id': gw,
+                  'limit': 1,
+              }).encode('utf-8')
+              req = urllib.request.Request(
+                  url,
+                  data=payload,
+                  headers={'Content-Type': 'application/json'},
+                  method='POST',
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  data = json.loads(response.read().decode('utf-8'))
+              if not data.get('ok'):
+                  raise SystemExit(f'{gw} {resource}: risposta non ok')
+              if data.get('source') != 'site':
+                  raise SystemExit(f'{gw} {resource}: source non site')
+              if data.get('database') != database:
+                  raise SystemExit(f'{gw} {resource}: database errato {data.get("database")}')
+              if data.get('game_world_id') != gw:
+                  raise SystemExit(f'{gw} {resource}: routing GW errato')
+              if data.get('resource') != resource:
+                  raise SystemExit(f'{gw} {resource}: resource errata')
+              if not (data.get('rows') or []):
+                  raise SystemExit(f'{gw} {resource}: nessuna riga restituita')
+              print(f'Gateway Site read verified: {gw} {resource} -> {database}')
           PY
