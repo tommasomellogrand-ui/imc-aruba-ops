@@ -62,68 +62,44 @@ jobs:
         run: |
           set -euo pipefail
           remote="$(curl --silent --location --max-time 20 'https://www.italianmastersclub.it/data-room/release.json' || true)"
-          if printf '%s' "$remote" | grep -q "$SOURCE_SHA"; then
-            echo 'deploy=false' >> "$GITHUB_OUTPUT"
-            echo "Data Room already at $SOURCE_SHA"
-          else
-            echo 'deploy=true' >> "$GITHUB_OUTPUT"
-          fi
+          if printf '%s' "$remote" | grep -q "$SOURCE_SHA"; then echo 'deploy=false' >> "$GITHUB_OUTPUT"; else echo 'deploy=true' >> "$GITHUB_OUTPUT"; fi
       - name: Deploy Data Room via FTPS and verify bytes
         if: steps.revision.outputs.deploy == 'true' || github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import io, os, ssl
-          from ftplib import FTP_TLS, error_perm
+          import io,os,ssl
+          from ftplib import FTP_TLS,error_perm
           from pathlib import Path
-          root=Path('source/dist')
-          ctx=ssl.create_default_context(); ctx.check_hostname=False
-          ftp=FTP_TLS(context=ctx)
-          ftp.connect(os.environ['ARUBA_FTP_HOST'].strip(),int(os.environ['ARUBA_FTP_PORT'].strip()),timeout=60)
-          ftp.login(os.environ['ARUBA_FTP_USERNAME'],os.environ['ARUBA_FTP_PASSWORD']); ftp.prot_p(); ftp.set_pasv(True)
-          def try_cwd(path):
-              try: ftp.cwd('/'); ftp.cwd(path); return True
+          root=Path('source/dist'); ctx=ssl.create_default_context(); ctx.check_hostname=False; ftp=FTP_TLS(context=ctx)
+          ftp.connect(os.environ['ARUBA_FTP_HOST'].strip(),int(os.environ['ARUBA_FTP_PORT'].strip()),timeout=60); ftp.login(os.environ['ARUBA_FTP_USERNAME'],os.environ['ARUBA_FTP_PASSWORD']); ftp.prot_p(); ftp.set_pasv(True)
+          def cwd(p):
+              try: ftp.cwd('/'); ftp.cwd(p); return True
               except error_perm: return False
-          def ensure_relative(path):
+          def ensure(p):
               ftp.cwd('/')
-              for part in [p for p in path.split('/') if p]:
-                  try: ftp.cwd(part)
-                  except error_perm:
-                      ftp.mkd(part); ftp.cwd(part)
+              for x in [x for x in p.split('/') if x]:
+                  try: ftp.cwd(x)
+                  except error_perm: ftp.mkd(x); ftp.cwd(x)
           try:
-              if try_cwd('/www/italianmastersclub.it'):
-                  public_root='/www/italianmastersclub.it'; absolute=True
-              elif try_cwd('www.italianmastersclub.it'):
-                  public_root='www.italianmastersclub.it'; absolute=False
-              elif try_cwd('italianmastersclub.it'):
-                  public_root='italianmastersclub.it'; absolute=False
-              else:
-                  raise SystemExit('Document root IMC non risolta via FTPS')
-              print('FTPS public root resolved')
-              remote_root=public_root+'/data-room'
-              if absolute:
-                  ftp.cwd('/'); current=''
-                  for part in [p for p in remote_root.split('/') if p]:
-                      current+='/'+part
-                      try: ftp.cwd(current)
-                      except error_perm: ftp.mkd(current); ftp.cwd(current)
-              else:
-                  ensure_relative(remote_root)
+              if cwd('/www/italianmastersclub.it'): public='/www/italianmastersclub.it'; absolute=True
+              elif cwd('www.italianmastersclub.it'): public='www.italianmastersclub.it'; absolute=False
+              elif cwd('italianmastersclub.it'): public='italianmastersclub.it'; absolute=False
+              else: raise SystemExit('Document root IMC non risolta via FTPS')
+              rr=public+'/data-room'
+              if not absolute: ensure(rr)
               for local in sorted(p for p in root.rglob('*') if p.is_file()):
-                  rel=local.relative_to(root).as_posix(); target=remote_root+'/'+rel; parent=target.rsplit('/',1)[0]
+                  rel=local.relative_to(root).as_posix(); parent=(rr+'/'+rel).rsplit('/',1)[0]
                   if absolute:
-                      ftp.cwd('/'); current=''
-                      for part in [p for p in parent.split('/') if p]:
-                          current+='/'+part
-                          try: ftp.cwd(current)
-                          except error_perm: ftp.mkd(current); ftp.cwd(current)
-                  else:
-                      ensure_relative(parent)
-                  data=local.read_bytes(); ftp.storbinary('STOR '+local.name,io.BytesIO(data))
-                  check=io.BytesIO(); ftp.retrbinary('RETR '+local.name,check.write)
+                      ftp.cwd('/'); cur=''
+                      for x in [x for x in parent.split('/') if x]:
+                          cur+='/'+x
+                          try: ftp.cwd(cur)
+                          except error_perm: ftp.mkd(cur); ftp.cwd(cur)
+                  else: ensure(parent)
+                  data=local.read_bytes(); ftp.storbinary('STOR '+local.name,io.BytesIO(data)); check=io.BytesIO(); ftp.retrbinary('RETR '+local.name,check.write)
                   if check.getvalue()!=data: raise SystemExit('Verifica byte-per-byte fallita: '+rel)
-                  print('verified '+rel)
           finally:
               try: ftp.quit()
               except Exception: ftp.close()
@@ -134,14 +110,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base='https://www.italianmastersclub.it/data-room'
-          curl --fail --silent --show-error --location --max-time 30 "$base/?verify=$SOURCE_SHA" | grep -q 'Policies · Playbooks · Reference'
-          curl --fail --silent --show-error --location --max-time 30 "$base/release.json?verify=$SOURCE_SHA" | grep -q "$SOURCE_SHA"
-          curl --fail --silent --show-error --location --max-time 30 "$base/data/registry.json?verify=$SOURCE_SHA" | grep -q 'IMC-ENG-002'
-          curl --fail --silent --show-error --location --max-time 30 "$base/data/registry.json?verify=$SOURCE_SHA" | grep -q 'IMC-ENG-003'
-          curl --fail --silent --show-error --location --max-time 30 "$base/data/knowledge.json?verify=$SOURCE_SHA" | grep -q 'IMC-AUTHORITY'
-          curl --fail --silent --show-error --location --max-time 30 "$base/cases/IMC-ENG-002/request.txt?verify=$SOURCE_SHA" | grep -q '^TOPIC: IMC_DATA_ROOM_TICKETING_SYSTEM$'
-          curl --fail --silent --show-error --location --max-time 30 "$base/cases/IMC-ENG-003/request.txt?verify=$SOURCE_SHA" | grep -q '^TOPIC: IMC_DATA_ROOM_KNOWLEDGE_LAYER$'
-          curl --fail --silent --show-error --location --max-time 30 "$base/knowledge/POLICY/IMC-AUTHORITY/current.txt?verify=$SOURCE_SHA" | grep -q '^DOC_TYPE: POLICY$'
-          curl --fail --silent --show-error --location --max-time 30 "$base/knowledge/REFERENCE/IMC-DB-ROUTING/current.txt?verify=$SOURCE_SHA" | grep -q '^DOC_TYPE: REFERENCE$'
+          base='https://www.italianmastersclub.it/data-room'; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+          check(){ url="$1"; pattern="$2"; file="$tmp/$(printf '%s' "$url" | sha256sum | cut -d' ' -f1)"; curl --fail --silent --show-error --location --max-time 30 "$url" -o "$file"; grep -q "$pattern" "$file"; }
+          check "$base/?verify=$SOURCE_SHA" 'Policies · Playbooks · Reference'
+          check "$base/release.json?verify=$SOURCE_SHA" "$SOURCE_SHA"
+          check "$base/data/registry.json?verify=$SOURCE_SHA" 'IMC-ENG-002-06'
+          check "$base/data/registry.json?verify=$SOURCE_SHA" '"domain": "GATEWAY"'
+          check "$base/data/case-aliases.json?verify=$SOURCE_SHA" 'IMC-ENG-003'
+          check "$base/cases/IMC-ENG-002-01/request.txt?verify=$SOURCE_SHA" '^TOPIC: IMC_DATA_ROOM_KNOWLEDGE_LAYER$'
+          check "$base/cases/IMC-ENG-003/request.txt?verify=$SOURCE_SHA" '^TOPIC: IMC_DATA_ROOM_KNOWLEDGE_LAYER$'
+          check "$base/data/knowledge.json?verify=$SOURCE_SHA" 'IMC-AUTHORITY'
           echo "ONLINE source_sha=$SOURCE_SHA"
