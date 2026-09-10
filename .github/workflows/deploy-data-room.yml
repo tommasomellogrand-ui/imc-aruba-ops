@@ -80,33 +80,51 @@ jobs:
           ftp=FTP_TLS(context=ctx)
           ftp.connect(os.environ['ARUBA_FTP_HOST'].strip(),int(os.environ['ARUBA_FTP_PORT'].strip()),timeout=60)
           ftp.login(os.environ['ARUBA_FTP_USERNAME'],os.environ['ARUBA_FTP_PASSWORD']); ftp.prot_p(); ftp.set_pasv(True)
-          def exists_dir(path):
-              try: ftp.cwd(path); return True
+          def try_cwd(path):
+              try: ftp.cwd('/'); ftp.cwd(path); return True
               except error_perm: return False
-          def ensure(path):
+          def ensure_relative(path):
               ftp.cwd('/')
-              current=''
               for part in [p for p in path.split('/') if p]:
-                  current+='/'+part
-                  try: ftp.cwd(current)
+                  try: ftp.cwd(part)
                   except error_perm:
-                      ftp.mkd(current); ftp.cwd(current)
+                      ftp.mkd(part); ftp.cwd(part)
           try:
-              if exists_dir('/www/italianmastersclub.it'):
+              if try_cwd('/www/italianmastersclub.it'):
                   public_root='/www/italianmastersclub.it'
+                  absolute=True
+              elif try_cwd('www.italianmastersclub.it'):
+                  public_root='www.italianmastersclub.it'
+                  absolute=False
+              elif try_cwd('italianmastersclub.it'):
+                  public_root='italianmastersclub.it'
+                  absolute=False
               else:
-                  ftp.cwd('/')
-                  if not any(exists_dir(p) for p in ('/site-assets','/minisite','/imc-universal-gateway','/gameworld001')):
-                      raise SystemExit('Root FTPS non riconosciuta come document root IMC')
-                  public_root=''
-              remote_root=public_root+'/data-room'
+                  raise SystemExit('Document root IMC non risolta via FTPS')
               print('FTPS public root resolved')
-              ensure(remote_root)
+              remote_root=public_root+'/data-room'
+              if absolute:
+                  ftp.cwd('/')
+                  current=''
+                  for part in [p for p in remote_root.split('/') if p]:
+                      current+='/'+part
+                      try: ftp.cwd(current)
+                      except error_perm: ftp.mkd(current); ftp.cwd(current)
+              else:
+                  ensure_relative(remote_root)
               for local in sorted(p for p in root.rglob('*') if p.is_file()):
-                  rel=local.relative_to(root).as_posix(); remote=remote_root+'/'+rel
-                  ensure(remote.rsplit('/',1)[0])
-                  data=local.read_bytes(); ftp.storbinary('STOR '+remote,io.BytesIO(data))
-                  check=io.BytesIO(); ftp.retrbinary('RETR '+remote,check.write)
+                  rel=local.relative_to(root).as_posix(); target=remote_root+'/'+rel
+                  parent=target.rsplit('/',1)[0]
+                  if absolute:
+                      ftp.cwd('/'); current=''
+                      for part in [p for p in parent.split('/') if p]:
+                          current+='/'+part
+                          try: ftp.cwd(current)
+                          except error_perm: ftp.mkd(current); ftp.cwd(current)
+                  else:
+                      ensure_relative(parent)
+                  data=local.read_bytes(); ftp.storbinary('STOR '+local.name,io.BytesIO(data))
+                  check=io.BytesIO(); ftp.retrbinary('RETR '+local.name,check.write)
                   if check.getvalue()!=data: raise SystemExit('Verifica byte-per-byte fallita: '+rel)
                   print('verified '+rel)
           finally:
