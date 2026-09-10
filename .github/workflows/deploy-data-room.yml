@@ -1,0 +1,117 @@
+name: OPS-004 · Deploy IMC Data Room
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imc-aruba-data-room
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ARUBA_FTP_HOST: ${{ vars.ARUBA_FTP_HOST }}
+      ARUBA_FTP_PORT: ${{ vars.ARUBA_FTP_PORT }}
+      ARUBA_FTP_ROOT: ${{ vars.ARUBA_FTP_ROOT }}
+      ARUBA_WEB_ROOT: ${{ vars.ARUBA_WEB_ROOT }}
+      ARUBA_FTP_USERNAME: ${{ secrets.ARUBA_FTP_USERNAME }}
+      ARUBA_FTP_PASSWORD: ${{ secrets.ARUBA_FTP_PASSWORD }}
+    steps:
+      - name: Checkout Data Room source of truth
+        uses: actions/checkout@v4
+        with:
+          repository: tommasomellogrand-ui/imc-data-room
+          ref: main
+          path: source
+      - name: Validate and build
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 source/tools/build_data_room.py
+          sha="$(git -C source rev-parse HEAD)"
+          printf '{"source_repository":"tommasomellogrand-ui/imc-data-room","source_sha":"%s"}\n' "$sha" > source/dist/release.json
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          test -s source/dist/index.html
+          test -s source/dist/data/registry.json
+          test -s source/dist/cases/IMC-ENG-002/request.txt
+      - name: Validate Aruba configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ARUBA_FTP_HOST:-}"; test -n "${ARUBA_FTP_PORT:-}"
+          test -n "${ARUBA_FTP_ROOT:-}"; test -n "${ARUBA_WEB_ROOT:-}"
+          test -n "${ARUBA_FTP_USERNAME:-}"; test -n "${ARUBA_FTP_PASSWORD:-}"
+          test "$ARUBA_FTP_PORT" = "21"
+          test "$ARUBA_FTP_ROOT" = "/"
+          test "$ARUBA_WEB_ROOT" = "/www/italianmastersclub.it"
+      - name: Check published revision
+        id: revision
+        env:
+          SOURCE_SHA: ${{ steps.build.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote="$(curl --silent --location --max-time 20 'https://www.italianmastersclub.it/data-room/release.json' || true)"
+          if printf '%s' "$remote" | grep -q "$SOURCE_SHA"; then
+            echo 'deploy=false' >> "$GITHUB_OUTPUT"
+            echo "Data Room already at $SOURCE_SHA"
+          else
+            echo 'deploy=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Deploy Data Room via FTPS and verify bytes
+        if: steps.revision.outputs.deploy == 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import io, os, ssl
+          from ftplib import FTP_TLS, error_perm
+          from pathlib import Path
+          root=Path('source/dist')
+          web_root=os.environ['ARUBA_WEB_ROOT'].rstrip('/')
+          remote_root=web_root+'/data-room'
+          if web_root!='/www/italianmastersclub.it': raise SystemExit('ARUBA_WEB_ROOT non autorizzata')
+          ftp=FTP_TLS(context=ssl.create_default_context())
+          ftp.connect(os.environ['ARUBA_FTP_HOST'].strip(),int(os.environ['ARUBA_FTP_PORT']),timeout=60)
+          ftp.login(os.environ['ARUBA_FTP_USERNAME'],os.environ['ARUBA_FTP_PASSWORD']); ftp.prot_p(); ftp.set_pasv(True)
+          def ensure(path):
+              current=''
+              for part in [p for p in path.split('/') if p]:
+                  current+='/'+part
+                  try: ftp.cwd(current)
+                  except error_perm:
+                      if current in ('/www','/www/italianmastersclub.it'): raise
+                      ftp.mkd(current); ftp.cwd(current)
+          try:
+              ensure(remote_root)
+              for local in sorted(p for p in root.rglob('*') if p.is_file()):
+                  rel=local.relative_to(root).as_posix(); remote=remote_root+'/'+rel
+                  ensure(remote.rsplit('/',1)[0])
+                  data=local.read_bytes(); ftp.storbinary('STOR '+remote,io.BytesIO(data))
+                  check=io.BytesIO(); ftp.retrbinary('RETR '+remote,check.write)
+                  if check.getvalue()!=data: raise SystemExit('Verifica byte-per-byte fallita: '+rel)
+                  print('verified '+rel)
+          finally:
+              try: ftp.quit()
+              except Exception: ftp.close()
+          PY
+      - name: Verify live Data Room
+        env:
+          SOURCE_SHA: ${{ steps.build.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base='https://www.italianmastersclub.it/data-room'
+          curl --fail --silent --show-error --location --max-time 30 "$base/?verify=$SOURCE_SHA" | grep -q 'IMC Data Room'
+          curl --fail --silent --show-error --location --max-time 30 "$base/release.json?verify=$SOURCE_SHA" | grep -q "$SOURCE_SHA"
+          curl --fail --silent --show-error --location --max-time 30 "$base/data/registry.json?verify=$SOURCE_SHA" | grep -q 'IMC-ENG-002'
+          curl --fail --silent --show-error --location --max-time 30 "$base/cases/IMC-ENG-002/request.txt?verify=$SOURCE_SHA" | grep -q '^TOPIC: IMC_DATA_ROOM_TICKETING_SYSTEM$'
+          echo "ONLINE source_sha=$SOURCE_SHA"
