@@ -19,8 +19,6 @@ jobs:
     env:
       ARUBA_FTP_HOST: ${{ vars.ARUBA_FTP_HOST }}
       ARUBA_FTP_PORT: ${{ vars.ARUBA_FTP_PORT }}
-      ARUBA_FTP_ROOT: ${{ vars.ARUBA_FTP_ROOT }}
-      ARUBA_WEB_ROOT: ${{ vars.ARUBA_WEB_ROOT }}
       ARUBA_FTP_USERNAME: ${{ secrets.ARUBA_FTP_USERNAME }}
       ARUBA_FTP_PASSWORD: ${{ secrets.ARUBA_FTP_PASSWORD }}
     steps:
@@ -48,13 +46,10 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import os
-          required=['ARUBA_FTP_HOST','ARUBA_FTP_PORT','ARUBA_WEB_ROOT','ARUBA_FTP_USERNAME','ARUBA_FTP_PASSWORD']
+          required=['ARUBA_FTP_HOST','ARUBA_FTP_PORT','ARUBA_FTP_USERNAME','ARUBA_FTP_PASSWORD']
           missing=[k for k in required if not os.environ.get(k,'').strip()]
           if missing: raise SystemExit('Configurazione Aruba mancante: '+','.join(missing))
-          port=os.environ['ARUBA_FTP_PORT'].strip()
-          web=os.environ['ARUBA_WEB_ROOT'].strip().rstrip('/')
-          if port!='21': raise SystemExit('ARUBA_FTP_PORT non autorizzata')
-          if web!='/www/italianmastersclub.it': raise SystemExit('ARUBA_WEB_ROOT non autorizzata')
+          if os.environ['ARUBA_FTP_PORT'].strip()!='21': raise SystemExit('ARUBA_FTP_PORT non autorizzata')
           print('Configurazione Aruba valida')
           PY
       - name: Check published revision
@@ -81,9 +76,8 @@ jobs:
           from ftplib import FTP_TLS, error_perm
           from pathlib import Path
           root=Path('source/dist')
-          web_root=os.environ['ARUBA_WEB_ROOT'].strip().rstrip('/')
+          web_root='/www/italianmastersclub.it'
           remote_root=web_root+'/data-room'
-          if web_root!='/www/italianmastersclub.it': raise SystemExit('ARUBA_WEB_ROOT non autorizzata')
           ftp=FTP_TLS(context=ssl.create_default_context())
           ftp.connect(os.environ['ARUBA_FTP_HOST'].strip(),int(os.environ['ARUBA_FTP_PORT'].strip()),timeout=60)
           ftp.login(os.environ['ARUBA_FTP_USERNAME'],os.environ['ARUBA_FTP_PASSWORD']); ftp.prot_p(); ftp.set_pasv(True)
