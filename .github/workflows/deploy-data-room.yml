@@ -76,22 +76,31 @@ jobs:
           from ftplib import FTP_TLS, error_perm
           from pathlib import Path
           root=Path('source/dist')
-          web_root='/www/italianmastersclub.it'
-          remote_root=web_root+'/data-room'
-          ctx=ssl.create_default_context()
-          ctx.check_hostname=False
+          ctx=ssl.create_default_context(); ctx.check_hostname=False
           ftp=FTP_TLS(context=ctx)
           ftp.connect(os.environ['ARUBA_FTP_HOST'].strip(),int(os.environ['ARUBA_FTP_PORT'].strip()),timeout=60)
           ftp.login(os.environ['ARUBA_FTP_USERNAME'],os.environ['ARUBA_FTP_PASSWORD']); ftp.prot_p(); ftp.set_pasv(True)
+          def exists_dir(path):
+              try: ftp.cwd(path); return True
+              except error_perm: return False
           def ensure(path):
+              ftp.cwd('/')
               current=''
               for part in [p for p in path.split('/') if p]:
                   current+='/'+part
                   try: ftp.cwd(current)
                   except error_perm:
-                      if current in ('/www','/www/italianmastersclub.it'): raise
                       ftp.mkd(current); ftp.cwd(current)
           try:
+              if exists_dir('/www/italianmastersclub.it'):
+                  public_root='/www/italianmastersclub.it'
+              else:
+                  ftp.cwd('/')
+                  if not any(exists_dir(p) for p in ('/site-assets','/minisite','/imc-universal-gateway','/gameworld001')):
+                      raise SystemExit('Root FTPS non riconosciuta come document root IMC')
+                  public_root=''
+              remote_root=public_root+'/data-room'
+              print('FTPS public root resolved')
               ensure(remote_root)
               for local in sorted(p for p in root.rglob('*') if p.is_file()):
                   rel=local.relative_to(root).as_posix(); remote=remote_root+'/'+rel
