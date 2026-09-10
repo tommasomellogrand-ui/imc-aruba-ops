@@ -39,7 +39,9 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           test -s source/dist/index.html
           test -s source/dist/data/registry.json
+          test -s source/dist/data/knowledge.json
           test -s source/dist/cases/IMC-ENG-002/request.txt
+          test -s source/dist/cases/IMC-ENG-003/request.txt
       - name: Validate Aruba configuration
         shell: bash
         run: |
@@ -91,21 +93,17 @@ jobs:
                       ftp.mkd(part); ftp.cwd(part)
           try:
               if try_cwd('/www/italianmastersclub.it'):
-                  public_root='/www/italianmastersclub.it'
-                  absolute=True
+                  public_root='/www/italianmastersclub.it'; absolute=True
               elif try_cwd('www.italianmastersclub.it'):
-                  public_root='www.italianmastersclub.it'
-                  absolute=False
+                  public_root='www.italianmastersclub.it'; absolute=False
               elif try_cwd('italianmastersclub.it'):
-                  public_root='italianmastersclub.it'
-                  absolute=False
+                  public_root='italianmastersclub.it'; absolute=False
               else:
                   raise SystemExit('Document root IMC non risolta via FTPS')
               print('FTPS public root resolved')
               remote_root=public_root+'/data-room'
               if absolute:
-                  ftp.cwd('/')
-                  current=''
+                  ftp.cwd('/'); current=''
                   for part in [p for p in remote_root.split('/') if p]:
                       current+='/'+part
                       try: ftp.cwd(current)
@@ -113,8 +111,7 @@ jobs:
               else:
                   ensure_relative(remote_root)
               for local in sorted(p for p in root.rglob('*') if p.is_file()):
-                  rel=local.relative_to(root).as_posix(); target=remote_root+'/'+rel
-                  parent=target.rsplit('/',1)[0]
+                  rel=local.relative_to(root).as_posix(); target=remote_root+'/'+rel; parent=target.rsplit('/',1)[0]
                   if absolute:
                       ftp.cwd('/'); current=''
                       for part in [p for p in parent.split('/') if p]:
@@ -138,8 +135,13 @@ jobs:
         run: |
           set -euo pipefail
           base='https://www.italianmastersclub.it/data-room'
-          curl --fail --silent --show-error --location --max-time 30 "$base/?verify=$SOURCE_SHA" | grep -q 'IMC Data Room'
+          curl --fail --silent --show-error --location --max-time 30 "$base/?verify=$SOURCE_SHA" | grep -q 'Policies · Playbooks · Reference'
           curl --fail --silent --show-error --location --max-time 30 "$base/release.json?verify=$SOURCE_SHA" | grep -q "$SOURCE_SHA"
           curl --fail --silent --show-error --location --max-time 30 "$base/data/registry.json?verify=$SOURCE_SHA" | grep -q 'IMC-ENG-002'
+          curl --fail --silent --show-error --location --max-time 30 "$base/data/registry.json?verify=$SOURCE_SHA" | grep -q 'IMC-ENG-003'
+          curl --fail --silent --show-error --location --max-time 30 "$base/data/knowledge.json?verify=$SOURCE_SHA" | grep -q 'IMC-AUTHORITY'
           curl --fail --silent --show-error --location --max-time 30 "$base/cases/IMC-ENG-002/request.txt?verify=$SOURCE_SHA" | grep -q '^TOPIC: IMC_DATA_ROOM_TICKETING_SYSTEM$'
+          curl --fail --silent --show-error --location --max-time 30 "$base/cases/IMC-ENG-003/request.txt?verify=$SOURCE_SHA" | grep -q '^TOPIC: IMC_DATA_ROOM_KNOWLEDGE_LAYER$'
+          curl --fail --silent --show-error --location --max-time 30 "$base/knowledge/POLICY/IMC-AUTHORITY/current.txt?verify=$SOURCE_SHA" | grep -q '^DOC_TYPE: POLICY$'
+          curl --fail --silent --show-error --location --max-time 30 "$base/knowledge/REFERENCE/IMC-DB-ROUTING/current.txt?verify=$SOURCE_SHA" | grep -q '^DOC_TYPE: REFERENCE$'
           echo "ONLINE source_sha=$SOURCE_SHA"
