@@ -78,7 +78,9 @@ jobs:
           root=Path('source/dist')
           web_root='/www/italianmastersclub.it'
           remote_root=web_root+'/data-room'
-          ftp=FTP_TLS(context=ssl.create_default_context())
+          ctx=ssl.create_default_context()
+          ctx.check_hostname=False
+          ftp=FTP_TLS(context=ctx)
           ftp.connect(os.environ['ARUBA_FTP_HOST'].strip(),int(os.environ['ARUBA_FTP_PORT'].strip()),timeout=60)
           ftp.login(os.environ['ARUBA_FTP_USERNAME'],os.environ['ARUBA_FTP_PASSWORD']); ftp.prot_p(); ftp.set_pasv(True)
           def ensure(path):
