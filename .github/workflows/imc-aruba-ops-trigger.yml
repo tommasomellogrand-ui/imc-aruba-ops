@@ -15,7 +15,7 @@ concurrency:
 jobs:
   dispatch:
     name: Dispatch approved OPS command
-    if: ${{ github.event.issue.title == 'RUN ARUBA FILESYSTEM INVENTORY' || github.event.issue.title == 'RUN ARUBA MINISITE MIGRATION' }}
+    if: ${{ github.event.issue.title == 'RUN ARUBA FILESYSTEM INVENTORY' || github.event.issue.title == 'RUN ARUBA MINISITE MIGRATION' || github.event.issue.title == 'RUN ARUBA DATA ROOM DEPLOY' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -26,33 +26,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           case "$OPS_TITLE" in
             'RUN ARUBA FILESYSTEM INVENTORY')
-              WORKFLOW='aruba-filesystem-inventory.yml'
-              COMMAND='OPS-001 · ARUBA Filesystem Inventory'
-              gh workflow run "$WORKFLOW" \
-                --repo "$GITHUB_REPOSITORY" \
-                --ref main
+              WORKFLOW='aruba-filesystem-inventory.yml'; COMMAND='OPS-001 · ARUBA Filesystem Inventory'
+              gh workflow run "$WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main
               ;;
             'RUN ARUBA MINISITE MIGRATION')
-              WORKFLOW='aruba-minisite-migration.yml'
-              COMMAND='OPS-002 · ARUBA Minisite Migration'
-              gh workflow run "$WORKFLOW" \
-                --repo "$GITHUB_REPOSITORY" \
-                --ref main \
-                -f confirm=MIGRATE_MINISITES
+              WORKFLOW='aruba-minisite-migration.yml'; COMMAND='OPS-002 · ARUBA Minisite Migration'
+              gh workflow run "$WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main -f confirm=MIGRATE_MINISITES
               ;;
-            *)
-              echo "Titolo non autorizzato: $OPS_TITLE" >&2
-              exit 1
+            'RUN ARUBA DATA ROOM DEPLOY')
+              WORKFLOW='deploy-data-room.yml'; COMMAND='OPS-004 · Deploy IMC Data Room'
+              gh workflow run "$WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main
               ;;
+            *) echo "Titolo non autorizzato: $OPS_TITLE" >&2; exit 1;;
           esac
-
           echo "Dispatched $COMMAND"
           {
-            echo '## IMC Aruba Ops Trigger'
-            echo
+            echo '## IMC Aruba Ops Trigger'; echo
             echo "- Command: \`$COMMAND\`"
             echo "- Trigger title: \`$OPS_TITLE\`"
             echo "- Dispatch target: \`$WORKFLOW\`"
